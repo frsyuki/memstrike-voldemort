@@ -1,32 +1,29 @@
-AC_INIT(memstrike.c)
+AC_INIT(memstrike-voldemort.cc)
 AC_CONFIG_AUX_DIR(ac)
-AM_INIT_AUTOMAKE(memstrike, 1.0.0)
+AM_INIT_AUTOMAKE(memstrike-voldemort, 1.0.0)
 AC_CONFIG_HEADER(config.h)
 
-
-AC_SUBST(CFLAGS)
-if test "" = "$CFLAGS"; then
-	CFLAGS="-O4 -g"
-fi
-CFLAGS="-O4 -g -Wall $CFLAGS"
+AC_SUBST(CXXFLAGS)
+CXXFLAGS="-O4 -g -Wall $CXXFLAGS"
 
 AC_PROG_CC
+AC_PROG_CXX
 
 
-AC_ARG_WITH([libmemcached],
-	AS_HELP_STRING([--with-libmemcached@<:@=DIR@:>@],
-				   [specify the root directory for libmemcached]),
-	[libmemcached_path="$withval"], [])
-if test "$libmemcached_path" != ""; then
-	CFLAGS="$CFLAGS -I$libmemcached_path/include"
-	LDFLAGS="$LDFLAGS -L$libmemcached_path/lib"
+AC_ARG_WITH([voldemort],
+	AS_HELP_STRING([--with-voldemort@<:@=DIR@:>@],
+				   [specify the root directory for voldemort]),
+	[voldemort_path="$withval"], [])
+if test "$voldemort_path" != ""; then
+	CXXFLAGS="$CXXFLAGS -I$voldemort_path/include"
+	LDFLAGS="$LDFLAGS -L$voldemort_path/lib"
 fi
 
 AC_CHECK_LIB(pthread,pthread_create,,
 	AC_MSG_ERROR([Can't find pthread library]))
 
-AC_CHECK_LIB(memcached,memcached_create,,
-	AC_MSG_ERROR([Can't find libmemcached library]))
+AC_CHECK_LIB(voldemort,main,,
+	AC_MSG_ERROR([Can't find voldemort library]))
 
 AC_OUTPUT([Makefile])
 

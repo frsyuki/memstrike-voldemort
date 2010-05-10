@@ -1,4 +1,4 @@
 
-bin_PROGRAMS = memstrike
-memstrike_SOURCES = memstrike.c
+bin_PROGRAMS = memstrike-voldemort
+memstrike_voldemort_SOURCES = memstrike-voldemort.cc
 

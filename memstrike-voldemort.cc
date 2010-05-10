@@ -1,5 +1,5 @@
 //
-// memstrike
+// memstrike-voldemort
 //
 // Copyright (c) 2008-2010 FURUHASHI Sadayuki
 //
@@ -32,23 +32,37 @@
 #include <stdbool.h>
 #include <sys/time.h>
 #include <pthread.h>
-#include <libmemcached/memcached.h>
+#include <voldemort/StoreClient.h>
+#include <voldemort/StoreClientFactory.h>
+#include <voldemort/SocketStoreClientFactory.h>
+#include <voldemort/ClientConfig.h>
+#include <sstream>
+#include <memory>
+
+using Voldemort::StoreClient;
+using Voldemort::StoreClientFactory;
+using Voldemort::SocketStoreClientFactory;
+using Voldemort::ClientConfig;
+using Voldemort::VersionedValue;
 
 extern char* optarg;
 extern int optint, opterr, optopt;
 const char* g_progname;
 
 static const char* g_host = "127.0.0.1";
-static unsigned short g_port = 11211;
-static char* g_server_list = NULL;
+static unsigned short g_port = 6666;
+
+static std::list<std::string> g_boostrap_urls;
+static ClientConfig* g_config;
+static StoreClientFactory* g_factory;
+
+static std::string g_store_name = "test";
 
 static unsigned long long g_num_request;
 static bool g_keymode_64 = false;
-static unsigned long g_num_multiplex = 1;
 static unsigned long g_num_thread = 1;
 static unsigned long g_keylen = 16;
 static unsigned long g_vallen = 1024;
-static bool g_binary = false;
 static bool g_noset = false;
 static bool g_noget = false;
 static unsigned long long g_offset = 0;
@@ -56,7 +70,7 @@ static bool g_del = false;
 
 static pthread_mutex_t g_count_lock;
 static pthread_cond_t  g_count_cond;
-static volatile int g_thread_count;
+static volatile unsigned int g_thread_count;
 static pthread_mutex_t g_thread_lock;
 
 #define KEY_FILL 'k'
@@ -88,7 +102,7 @@ void show_timer()
 static pthread_t* create_worker(void* (*func)(void*))
 {
 	unsigned long i;
-	pthread_t* threads = malloc(sizeof(pthread_t)*g_num_thread);
+	pthread_t* threads = (pthread_t*)malloc(sizeof(pthread_t)*g_num_thread);
 
 	pthread_mutex_lock(&g_thread_lock);
 	g_thread_count = 0;
@@ -140,44 +154,27 @@ static unsigned long wait_worker_ready()
 }
 
 
-static memcached_st* initialize_user()
+void initialize_global()
 {
-	memcached_st* st = memcached_create(NULL);
-	if(!st) {
-		perror("memcached_create failed");
-		exit(1);
-	}
+	g_config = new ClientConfig();
 
-	if(g_server_list) {
-		memcached_server_st* list = memcached_servers_parse(g_server_list);
-		if(list == NULL) {
-			fprintf(stderr, "invalid server list\n");
-			exit(1);
-		}
-		if(memcached_server_push(st, list) != MEMCACHED_SUCCESS) {
-			// FIXME
-		}
-		memcached_server_list_free(list);
+	std::ostringstream s;
+	s << "tcp://"<<g_host<<":"<<g_port;
+	g_boostrap_urls.push_back(s.str());
 
-	} else {
-		char* hostbuf = strdup(g_host);
-		memcached_server_add(st, hostbuf, g_port);
-		free(hostbuf);
-	}
+	g_config->setBootstrapUrls(&g_boostrap_urls);
 
-	if(g_binary) {
-		memcached_behavior_set(st, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL, 1);
-	}
+	g_factory = new SocketStoreClientFactory(*g_config);
+}
 
-	//memcached_behavior_set(st, MEMCACHED_BEHAVIOR_POLL_TIMEOUT, 20*1000);
-	//memcached_behavior_set(st, MEMCACHED_BEHAVIOR_CONNECT_TIMEOUT, 20*1000);
-
-	return st;
+static StoreClient* initialize_user()
+{
+	return g_factory->getStoreClient(g_store_name);
 }
 
 static char* malloc_keybuf()
 {
-	char* keybuf = malloc(g_keylen+1);
+	char* keybuf = (char*)malloc(g_keylen+1);
 	if(!keybuf) {
 		perror("malloc for key failed");
 		exit(1);
@@ -189,7 +186,7 @@ static char* malloc_keybuf()
 
 static char* malloc_valbuf()
 {
-	char* valbuf = malloc(g_vallen);
+	char* valbuf = (char*)malloc(g_vallen);
 	if(!valbuf) {
 		perror("malloc for value failed");
 		exit(1);
@@ -237,107 +234,53 @@ static void pack_keynum(char* keybuf, unsigned long long i)
 static void* worker_set(void* trash)
 {
 	unsigned long long i, t;
-	memcached_return ret;
-	memcached_st* st = initialize_user();
+	StoreClient* st = initialize_user();
 	char* keybuf = malloc_keybuf();
 	char* valbuf = malloc_valbuf();
+	std::string value(valbuf, g_vallen);
 	
 	printf("s");
 	t = wait_worker_ready();
 
 	for(i=t*g_num_request, t=i+g_num_request; i < t; ++i) {
 		pack_keynum(keybuf, i);
-		ret = memcached_set(st, keybuf, g_keylen, valbuf, g_vallen, 0, 0);
-		if(ret != MEMCACHED_SUCCESS) {
-			fprintf(stderr, "set failed: %s\n", memcached_strerror(st, ret));
+		std::string key(keybuf, g_keylen);
+		try {
+			st->put(&key, &value);
+		} catch (std::exception& e) {
+			fprintf(stderr, "set failed: %s\n", e.what());
 		}
 	}
 	
 	free(keybuf);
 	free(valbuf);
-	memcached_free(st);
 	return NULL;
 }
 
 static void* worker_get(void* trash)
 {
 	unsigned long long i, t;
-	unsigned long m;
-	memcached_st* st = initialize_user();
-	char* mkeybuf[g_num_multiplex];
-	size_t mkeylen[g_num_multiplex];
-	char* value;
-	size_t vallen;
-	uint32_t flags;
-	memcached_return ret;
-
-	for(m=0; m < g_num_multiplex; ++m) {
-		mkeybuf[m] = malloc_keybuf();
-	}
+	StoreClient* st = initialize_user();
 
 	printf("g");
 	t = wait_worker_ready();
 
-	if(g_num_multiplex == 1) {
-		char* keybuf = mkeybuf[0];
-		for(i=t*g_num_request, t=i+g_num_request; i < t; ++i) {
-			pack_keynum(keybuf, i);
-			value = memcached_get(st, keybuf, g_keylen,
-					&vallen, &flags, &ret);
-			if(ret != MEMCACHED_SUCCESS) {
-				fprintf(stderr, "get failed: %s\n", memcached_strerror(st, ret));
-			} else if(!value) {
+	char* keybuf = malloc_keybuf();
+
+	for(i=t*g_num_request, t=i+g_num_request; i < t; ++i) {
+		pack_keynum(keybuf, i);
+		std::string key(keybuf, g_keylen);
+		try {
+			const VersionedValue* value = st->get(&key);
+			if(!value) {
 				fprintf(stderr, "get failed: key not found\n");
 			}
-			free(value);
-		}
-	} else {
-		for(i=t*g_num_request, t=i+g_num_request; i < t; ) {
-
-			for(m=0; m < g_num_multiplex; ++m) {
-				pack_keynum(mkeybuf[m], i+m);
-				mkeylen[m] = g_keylen;
-			}
-
-			ret = memcached_mget(st, mkeybuf, mkeylen, g_num_multiplex);
-			if (ret != MEMCACHED_SUCCESS) {
-				fprintf(stderr, "mget failed: %s\n", memcached_strerror(st, ret));
-				goto err;
-			}
-
-			for(m=0; true; ++m) {
-				value = memcached_fetch(st, mkeybuf[m], &mkeylen[m],
-								&vallen, &flags, &ret);
-				if(!value) {
-					break;
-				}
-
-				if(ret != MEMCACHED_SUCCESS) {
-					fprintf(stderr, "get failed: %s\n", memcached_strerror(st, ret));
-				}
-
-				if(mkeylen[m] != g_keylen) {
-					fprintf(stderr, "key length not match: expect %lu but got %lu\n",
-							g_keylen, mkeylen[m]);
-				}
-
-				free(value);
-			}
-
-			if(m != g_num_multiplex) {
-				fprintf(stderr, "num keys not match: expect %lu but got %lu\n",
-						g_num_multiplex, m);
-			}
-
-			err:
-			i += g_num_multiplex;
+		} catch (std::exception& e) {
+			fprintf(stderr, "get failed: %s\n", e.what());
 		}
 	}
 
-	for(m=0; m < g_num_multiplex; ++m) {
-		free(mkeybuf[m]);
-	}
-	memcached_free(st);
+	free(keybuf);
 	return NULL;
 }
 
@@ -345,8 +288,7 @@ static void* worker_get(void* trash)
 static void* worker_del(void* trash)
 {
 	unsigned long long i, t;
-	memcached_return ret;
-	memcached_st* st = initialize_user();
+	StoreClient* st = initialize_user();
 	char* keybuf = malloc_keybuf();
 
 	printf("d");
@@ -354,14 +296,15 @@ static void* worker_del(void* trash)
 
 	for(i=t*g_num_request, t=i+g_num_request; i < t; ++i) {
 		pack_keynum(keybuf, i);
-		ret = memcached_delete(st, keybuf, g_keylen, 0);
-		if(ret != MEMCACHED_SUCCESS) {
-			fprintf(stderr, "del failed: %s\n", memcached_strerror(st, ret));
+		std::string key(keybuf, g_keylen);
+		try {
+			st->deleteKey(&key);
+		} catch (std::exception& e) {
+			fprintf(stderr, "del failed: %s\n", e.what());
 		}
 	}
 
 	free(keybuf);
-	memcached_free(st);
 	return NULL;
 }
 
@@ -369,9 +312,9 @@ static void* worker_del(void* trash)
 static void usage(const char* msg)
 {
 	printf("Usage: %s [options]    <num requests>\n"
-		" -l HOST=127.0.0.1  : memcached server address\n"
-		" -p PORT=11211      : memcached server port\n"
-		" -d SERVER_LIST     : comma-separated memcached server list\n"
+		" -l HOST=127.0.0.1  : bootstrap server address\n"
+		" -p PORT=6666       : bootstrap server port\n"
+		" -a NAME=test       : store name\n"
 		" -k SIZE=16         : size of key >= 8\n"
 		" -v SIZE=1024       : size of value\n"
 		" -m NUM=1           : get multiplex\n"
@@ -391,7 +334,7 @@ static void parse_argv(int argc, char* argv[])
 {
 	int c;
 	g_progname = argv[0];
-	while((c = getopt(argc, argv, "hbgsxl:p:k:v:m:t:o:d:")) != -1) {
+	while((c = getopt(argc, argv, "hbgsxl:p:a:k:v:m:t:o:d:")) != -1) {
 		switch(c) {
 		case 'l':
 			g_host = optarg;
@@ -402,6 +345,10 @@ static void parse_argv(int argc, char* argv[])
 			if(g_port == 0) { usage("invalid port number"); }
 			break;
 
+		case 'a':
+			g_store_name = optarg;
+			break;
+
 		case 'k':
 			g_keylen = strtol(optarg, NULL, 10);
 			if(g_keylen < 8) { usage("invalid key size"); }
@@ -410,14 +357,6 @@ static void parse_argv(int argc, char* argv[])
 		case 'v':
 			g_vallen  = strtol(optarg, NULL, 10);
 			if(g_vallen == 0) { usage("invalid value size"); }
-			break;
-
-		case 'b':
-			g_binary = true;
-			break;
-
-		case 'm':
-			g_num_multiplex  = strtol(optarg, NULL, 10);
 			break;
 
 		case 't':
@@ -437,10 +376,6 @@ static void parse_argv(int argc, char* argv[])
 			if(g_offset == 0) { usage("invalid key offset"); }
 			break;
 
-		case 'd':
-			g_server_list = optarg;
-			break;
-
 		case 'x':
 			g_del = true;
 			break;
@@ -457,9 +392,9 @@ static void parse_argv(int argc, char* argv[])
 	if(argc != 1) { usage(NULL); }
 
 	char* numstr = argv[optind];
-	long long int multiplex_request = strtoll(numstr, NULL, 10) / g_num_thread / g_num_multiplex;
+	long long int multiplex_request = strtoll(numstr, NULL, 10) / g_num_thread;
 
-	g_num_request = multiplex_request * g_num_multiplex;
+	g_num_request = multiplex_request;
 
 	if(g_num_request == 0) { usage("invalid number of request"); }
 
@@ -473,7 +408,6 @@ static void parse_argv(int argc, char* argv[])
 	printf("number of threads    : %lu\n",  g_num_thread);
 	printf("number of requests   : %llu\n", g_num_request * g_num_thread);
 	printf("requests per thread  : %llu\n", g_num_request);
-	printf("get multiplex        : %lu\n",  g_num_multiplex);
 	printf("size of key          : %lu bytes\n", g_keylen);
 	printf("size of value        : %lu bytes\n", g_vallen);
 }
@@ -489,6 +423,8 @@ int main(int argc, char* argv[])
 	pthread_mutex_init(&g_count_lock, NULL);
 	pthread_cond_init(&g_count_cond, NULL);
 	pthread_mutex_init(&g_thread_lock, NULL);
+
+	initialize_global();
 
 	if(!g_noset) {
 		printf("----\n[");
